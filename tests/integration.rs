@@ -105,11 +105,15 @@ fn get_process_cpu_percent(pid: u32) -> Option<f32> {
 }
 
 fn get_binary_path() -> String {
-    if cfg!(debug_assertions) {
-        "./target/debug/mem".to_string()
-    } else {
-        "./target/release/mem".to_string()
-    }
+    option_env!("CARGO_BIN_EXE_mem")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if cfg!(debug_assertions) {
+                "./target/debug/mem".to_string()
+            } else {
+                "./target/release/mem".to_string()
+            }
+        })
 }
 
 fn spawn_mem(args: &[&str]) -> ProcessGuard {
