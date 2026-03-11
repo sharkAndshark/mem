@@ -1,0 +1,9 @@
+[package]
+name = "mem"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+sys-info = "0.9"
