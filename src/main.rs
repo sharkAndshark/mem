@@ -252,3 +252,143 @@ fn main() {
     drop(memory_consumer);
     println!("\nStopped.");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_cpu_fixed() {
+        assert!(matches!(parse_cpu("100"), CpuTarget::Fixed(100)));
+        assert!(matches!(parse_cpu("200"), CpuTarget::Fixed(200)));
+        assert!(matches!(parse_cpu("1"), CpuTarget::Fixed(1)));
+    }
+
+    #[test]
+    fn test_parse_cpu_dynamic() {
+        match parse_cpu("50%") {
+            CpuTarget::Dynamic(p) => assert!((p - 50.0).abs() < 0.01),
+            _ => panic!("Expected Dynamic"),
+        }
+        match parse_cpu("100%") {
+            CpuTarget::Dynamic(p) => assert!((p - 100.0).abs() < 0.01),
+            _ => panic!("Expected Dynamic"),
+        }
+        match parse_cpu("25.5%") {
+            CpuTarget::Dynamic(p) => assert!((p - 25.5).abs() < 0.01),
+            _ => panic!("Expected Dynamic"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cpu_none() {
+        assert!(matches!(parse_cpu("0"), CpuTarget::None));
+        assert!(matches!(parse_cpu(""), CpuTarget::None));
+        assert!(matches!(parse_cpu("   "), CpuTarget::None));
+        assert!(matches!(parse_cpu("invalid"), CpuTarget::None));
+        assert!(matches!(parse_cpu("abc%"), CpuTarget::None));
+    }
+
+    #[test]
+    fn test_parse_cpu_trim() {
+        match parse_cpu("  50%  ") {
+            CpuTarget::Dynamic(p) => assert!((p - 50.0).abs() < 0.01),
+            _ => panic!("Expected Dynamic"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_gb() {
+        match parse_memory("2GB") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+        match parse_memory("2G") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+        match parse_memory("1GB") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_mb() {
+        match parse_memory("512M") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 512 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+        match parse_memory("512MB") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 512 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_kb() {
+        match parse_memory("1024K") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+        match parse_memory("1024KB") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_bytes() {
+        match parse_memory("1024") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024),
+            _ => panic!("Expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_dynamic() {
+        match parse_memory("50%") {
+            MemoryTarget::Dynamic(p) => assert!((p - 50.0).abs() < 0.01),
+            _ => panic!("Expected Dynamic"),
+        }
+        match parse_memory("100%") {
+            MemoryTarget::Dynamic(p) => assert!((p - 100.0).abs() < 0.01),
+            _ => panic!("Expected Dynamic"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_none() {
+        assert!(matches!(parse_memory("0"), MemoryTarget::None));
+        assert!(matches!(parse_memory(""), MemoryTarget::None));
+        assert!(matches!(parse_memory("   "), MemoryTarget::None));
+    }
+
+    #[test]
+    fn test_parse_memory_case_insensitive() {
+        match parse_memory("2gb") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+        match parse_memory("2Gb") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_trim() {
+        match parse_memory("  2GB  ") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
+            _ => panic!("Expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_invalid() {
+        match parse_memory("abc") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
+            _ => panic!("Expected Fixed with 0"),
+        }
+    }
+}
