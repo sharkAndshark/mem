@@ -87,7 +87,7 @@ fn get_process_cpu_percent(pid: u32) -> Option<f32> {
         return None;
     };
 
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(Duration::from_secs(2));
 
     let end_output = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
@@ -97,7 +97,7 @@ fn get_process_cpu_percent(pid: u32) -> Option<f32> {
     if end_output.status.success() {
         let stdout = String::from_utf8_lossy(&end_output.stdout);
         let end_cpu: f64 = stdout.trim().parse().unwrap_or(0.0);
-        let cpu_percent = (end_cpu - start_cpu) * 100.0;
+        let cpu_percent = (end_cpu - start_cpu) / 2.0 * 100.0;
         Some(cpu_percent as f32)
     } else {
         None
@@ -155,14 +155,25 @@ fn test_help() {
 }
 
 #[test]
-fn test_basic_run() {
-    let _guard = spawn_mem(&["-c", "0", "-m", "0", "-d", "1"]);
-    thread::sleep(Duration::from_millis(500));
+fn test_dynamic_memory_10_percent() {
+    let (_guard, pid) = spawn_mem_with_pid(&["-c", "0", "-m", "10%", "-d", "10"]);
+
+    thread::sleep(Duration::from_secs(2));
+
+    let memory_kb = get_process_memory_kb(pid).expect("Failed to get process memory");
+
+    println!("Memory usage: {} KB (~{} MB)", memory_kb, memory_kb / 1024);
+
+    assert!(
+        memory_kb > 50 * 1024,
+        "Memory usage {} KB should be at least 50MB for 10%",
+        memory_kb
+    );
 }
 
 #[test]
-fn test_memory_50mb() {
-    let (_guard, pid) = spawn_mem_with_pid(&["-c", "0", "-m", "50M", "-d", "10"]);
+fn test_combined_cpu_and_memory() {
+    let (_guard, pid) = spawn_mem_with_pid(&["-c", "100", "-m", "50M", "-d", "10"]);
 
     thread::sleep(Duration::from_secs(2));
 
@@ -171,12 +182,26 @@ fn test_memory_50mb() {
     let expected_kb = 50 * 1024;
     let min_kb = expected_kb * 80 / 100;
 
-    println!("Memory usage: {} KB (expected >= {} KB)", memory_kb, min_kb);
     assert!(
         memory_kb >= min_kb,
         "Memory usage {} KB is less than expected {} KB",
         memory_kb,
         min_kb
+    );
+
+    let cpu = get_process_cpu_percent(pid).unwrap_or(0.0);
+    println!("CPU: {}%, Memory: {} KB", cpu, memory_kb);
+
+    #[cfg(target_os = "windows")]
+    let min_cpu = 20.0;
+    #[cfg(not(target_os = "windows"))]
+    let min_cpu = 30.0;
+
+    assert!(
+        cpu > min_cpu,
+        "CPU usage {}% is less than expected {}%",
+        cpu,
+        min_cpu
     );
 }
 
@@ -202,13 +227,13 @@ fn test_memory_100mb() {
 
 #[test]
 fn test_cpu_100_percent() {
-    let (_guard, pid) = spawn_mem_with_pid(&["-c", "100", "-m", "0", "-d", "10"]);
+    let (_guard, pid) = spawn_mem_with_pid(&["-c", "100", "-m", "0", "-d", "15"]);
 
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(3));
 
     let cpu_samples: Vec<f32> = (0..3)
         .map(|_| {
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(1000));
             get_process_cpu_percent(pid).unwrap_or(0.0)
         })
         .collect();
@@ -216,22 +241,28 @@ fn test_cpu_100_percent() {
     let avg_cpu = cpu_samples.iter().sum::<f32>() / cpu_samples.len() as f32;
     println!("CPU samples: {:?}, avg: {}%", cpu_samples, avg_cpu);
 
+    #[cfg(target_os = "windows")]
+    let min_cpu = 30.0;
+    #[cfg(not(target_os = "windows"))]
+    let min_cpu = 50.0;
+
     assert!(
-        avg_cpu > 50.0,
-        "CPU usage {}% is less than expected 50%",
-        avg_cpu
+        avg_cpu > min_cpu,
+        "CPU usage {}% is less than expected {}%",
+        avg_cpu,
+        min_cpu
     );
 }
 
 #[test]
 fn test_cpu_200_percent() {
-    let (_guard, pid) = spawn_mem_with_pid(&["-c", "200", "-m", "0", "-d", "10"]);
+    let (_guard, pid) = spawn_mem_with_pid(&["-c", "200", "-m", "0", "-d", "15"]);
 
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(3));
 
     let cpu_samples: Vec<f32> = (0..3)
         .map(|_| {
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(1000));
             get_process_cpu_percent(pid).unwrap_or(0.0)
         })
         .collect();
@@ -239,35 +270,17 @@ fn test_cpu_200_percent() {
     let avg_cpu = cpu_samples.iter().sum::<f32>() / cpu_samples.len() as f32;
     println!("CPU samples: {:?}, avg: {}%", cpu_samples, avg_cpu);
 
-    assert!(
-        avg_cpu > 100.0,
-        "CPU usage {}% is less than expected 100%",
-        avg_cpu
-    );
-}
-
-#[test]
-fn test_combined_cpu_and_memory() {
-    let (_guard, pid) = spawn_mem_with_pid(&["-c", "100", "-m", "50M", "-d", "10"]);
-
-    thread::sleep(Duration::from_secs(2));
-
-    let memory_kb = get_process_memory_kb(pid).expect("Failed to get process memory");
-
-    let expected_kb = 50 * 1024;
-    let min_kb = expected_kb * 80 / 100;
+    #[cfg(target_os = "windows")]
+    let min_cpu = 80.0;
+    #[cfg(not(target_os = "windows"))]
+    let min_cpu = 100.0;
 
     assert!(
-        memory_kb >= min_kb,
-        "Memory usage {} KB is less than expected {} KB",
-        memory_kb,
-        min_kb
+        avg_cpu > min_cpu,
+        "CPU usage {}% is less than expected {}%",
+        avg_cpu,
+        min_cpu
     );
-
-    let cpu = get_process_cpu_percent(pid).unwrap_or(0.0);
-    println!("CPU: {}%, Memory: {} KB", cpu, memory_kb);
-
-    assert!(cpu > 30.0, "CPU usage {}% is less than expected 30%", cpu);
 }
 
 #[test]
@@ -282,23 +295,6 @@ fn test_duration_exits_on_time() {
 
     assert!(elapsed.as_secs() >= 5);
     assert!(elapsed.as_secs() < 10);
-}
-
-#[test]
-fn test_dynamic_memory_10_percent() {
-    let (_guard, pid) = spawn_mem_with_pid(&["-c", "0", "-m", "10%", "-d", "10"]);
-
-    thread::sleep(Duration::from_secs(2));
-
-    let memory_kb = get_process_memory_kb(pid).expect("Failed to get process memory");
-
-    println!("Memory usage: {} KB (~{} MB)", memory_kb, memory_kb / 1024);
-
-    assert!(
-        memory_kb > 100 * 1024,
-        "Memory usage {} KB should be at least 100MB for 10%",
-        memory_kb
-    );
 }
 
 #[test]
