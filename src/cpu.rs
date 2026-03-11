@@ -16,14 +16,6 @@ impl CpuConsumer {
         }
     }
 
-    pub fn get_target(&self) -> u32 {
-        self.target_percent.load(Ordering::Relaxed)
-    }
-
-    pub fn update_target(&self, new_target: u32) {
-        self.target_percent.store(new_target, Ordering::Relaxed);
-    }
-
     pub fn start(&self) {
         let max_threads = 8;
         for thread_id in 0..max_threads {
@@ -49,7 +41,7 @@ impl CpuConsumer {
                 continue;
             }
 
-            let total_threads = ((current_target / 100.0).ceil() as usize).max(1).min(8);
+            let total_threads = ((current_target / 100.0).ceil() as usize).clamp(1, 8);
 
             if thread_id >= total_threads {
                 thread::sleep(Duration::from_millis(100));

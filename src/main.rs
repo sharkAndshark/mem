@@ -41,8 +41,7 @@ fn parse_cpu(s: &str) -> CpuTarget {
         return CpuTarget::None;
     }
 
-    if s.ends_with('%') {
-        let num_str = &s[..s.len() - 1];
+    if let Some(num_str) = s.strip_suffix('%') {
         if let Ok(percent) = num_str.parse::<f64>() {
             if percent > 0.0 && percent <= 100.0 {
                 return CpuTarget::Dynamic(percent);
@@ -65,8 +64,7 @@ fn parse_memory(s: &str) -> MemoryTarget {
         return MemoryTarget::None;
     }
 
-    if s.ends_with('%') {
-        let num_str = &s[..s.len() - 1];
+    if let Some(num_str) = s.strip_suffix('%') {
         if let Ok(percent) = num_str.parse::<f64>() {
             if percent > 0.0 && percent <= 100.0 {
                 return MemoryTarget::Dynamic(percent);
@@ -140,8 +138,9 @@ fn main() {
         }
         CpuTarget::Dynamic(percent) => {
             println!("CPU: dynamic {}%", percent);
-            let target = (*percent * cpu_cores as f64).min(cpu_cores as f64 * 8.0) as u32;
-            Some(cpu::consume(target, Arc::clone(&running)))
+            let target = (*percent * cpu_cores as f64).min(cpu_cores as f64 * 100.0) as u32;
+            let arc = cpu::consume(target, Arc::clone(&running));
+            Some(arc)
         }
         CpuTarget::None => {
             println!("CPU: none");
@@ -201,14 +200,29 @@ fn main() {
             let available_memory = get_available_memory();
             let current_mem_usage = memory_consumer.get_current_usage();
 
+            let cpu_percent = cpu_target_arc
+                .as_ref()
+                .map(|arc| arc.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let mem_gb = current_mem_usage as f64 / (1024.0 * 1024.0 * 1024.0);
+            let total_mem_gb = total_memory as f64 / (1024.0 * 1024.0 * 1024.0);
+            let mem_percent = if total_memory > 0 {
+                let pct = current_mem_usage as f64 / total_memory as f64 * 100.0;
+                pct.round() as u32
+            } else {
+                0
+            };
+
+            println!(
+                "[Running] CPU: {}% | MEM: {:.2} GB / {:.2} GB ({}%)",
+                cpu_percent, mem_gb, total_mem_gb, mem_percent
+            );
+
             if let Some(ref cpu_arc) = &cpu_target_arc {
-                match &cpu_target {
-                    CpuTarget::Dynamic(percent) => {
-                        let target_percent =
-                            (*percent * cpu_cores as f64).min(cpu_cores as f64 * 8.0) as u32;
-                        cpu_arc.store(target_percent, Ordering::Relaxed);
-                    }
-                    _ => {}
+                if let CpuTarget::Dynamic(percent) = &cpu_target {
+                    let target_percent =
+                        (*percent * cpu_cores as f64).min(cpu_cores as f64 * 100.0) as u32;
+                    cpu_arc.store(target_percent, Ordering::Relaxed);
                 }
             }
 
@@ -216,13 +230,6 @@ fn main() {
                 MemoryTarget::Dynamic(percent) => {
                     let target_bytes = (total_memory as f64 * percent / 100.0) as usize;
                     if current_mem_usage != target_bytes {
-                        println!(
-                            "Adjusting memory: {} MB -> {} MB ({}% of {} GB)",
-                            current_mem_usage / (1024 * 1024),
-                            target_bytes / (1024 * 1024),
-                            percent,
-                            total_memory / (1024 * 1024 * 1024)
-                        );
                         memory_consumer.adjust_to(target_bytes, Arc::clone(&running));
                     }
                 }

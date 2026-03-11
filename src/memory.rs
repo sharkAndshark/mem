@@ -31,11 +31,15 @@ impl MemoryConsumer {
                 if !running.load(Ordering::Relaxed) {
                     return;
                 }
-                self.data.push(vec![0xAAu8; chunk_size]);
+                let mut chunk = Vec::with_capacity(chunk_size);
+                chunk.resize(chunk_size, 0xAA);
+                self.data.push(chunk);
             }
 
             if remainder > 0 && running.load(Ordering::Relaxed) {
-                self.data.push(vec![0xAAu8; remainder]);
+                let mut chunk = Vec::with_capacity(remainder);
+                chunk.resize(remainder, 0xAA);
+                self.data.push(chunk);
             }
         } else if target_bytes < current {
             let to_release = current - target_bytes;
