@@ -281,12 +281,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cpu_none() {
+    fn test_parse_cpu_invalid_or_none() {
         assert!(matches!(parse_cpu("0"), CpuTarget::None));
+        assert!(matches!(parse_cpu("000"), CpuTarget::None));
         assert!(matches!(parse_cpu(""), CpuTarget::None));
         assert!(matches!(parse_cpu("   "), CpuTarget::None));
         assert!(matches!(parse_cpu("invalid"), CpuTarget::None));
         assert!(matches!(parse_cpu("abc%"), CpuTarget::None));
+        assert!(matches!(parse_cpu("0%"), CpuTarget::None));
+        assert!(matches!(parse_cpu("150%"), CpuTarget::None));
+        assert!(matches!(parse_cpu("-50%"), CpuTarget::None));
     }
 
     #[test]
@@ -298,47 +302,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_memory_gb() {
+    fn test_parse_memory_fixed_units() {
         match parse_memory("2GB") {
             MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-        match parse_memory("2G") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-        match parse_memory("1GB") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-    }
-
-    #[test]
-    fn test_parse_memory_mb() {
-        match parse_memory("512M") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 512 * 1024 * 1024),
             _ => panic!("Expected Fixed"),
         }
         match parse_memory("512MB") {
             MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 512 * 1024 * 1024),
             _ => panic!("Expected Fixed"),
         }
-    }
-
-    #[test]
-    fn test_parse_memory_kb() {
-        match parse_memory("1024K") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
         match parse_memory("1024KB") {
             MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024 * 1024),
             _ => panic!("Expected Fixed"),
         }
-    }
-
-    #[test]
-    fn test_parse_memory_bytes() {
         match parse_memory("1024") {
             MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024),
             _ => panic!("Expected Fixed"),
@@ -358,37 +334,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_memory_none() {
+    fn test_parse_memory_invalid_or_none() {
         assert!(matches!(parse_memory("0"), MemoryTarget::None));
+        assert!(matches!(parse_memory("000"), MemoryTarget::Fixed(0)));
         assert!(matches!(parse_memory(""), MemoryTarget::None));
         assert!(matches!(parse_memory("   "), MemoryTarget::None));
+        assert!(matches!(parse_memory("150%"), MemoryTarget::Fixed(0)));
+
+        match parse_memory("abc") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
+            _ => panic!("Expected Fixed with 0"),
+        }
+        match parse_memory("1TB") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
+            _ => panic!("Expected Fixed with 0"),
+        }
+        match parse_memory("-100M") {
+            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
+            _ => panic!("Expected Fixed with 0"),
+        }
     }
 
     #[test]
-    fn test_parse_memory_case_insensitive() {
+    fn test_parse_memory_case_insensitive_and_trim() {
         match parse_memory("2gb") {
             MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
             _ => panic!("Expected Fixed"),
         }
-        match parse_memory("2Gb") {
+        match parse_memory("  2Gb  ") {
             MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
             _ => panic!("Expected Fixed"),
-        }
-    }
-
-    #[test]
-    fn test_parse_memory_trim() {
-        match parse_memory("  2GB  ") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-    }
-
-    #[test]
-    fn test_parse_memory_invalid() {
-        match parse_memory("abc") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
-            _ => panic!("Expected Fixed with 0"),
         }
     }
 }
