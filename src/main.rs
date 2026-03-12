@@ -107,6 +107,43 @@ fn get_cpu_cores() -> u32 {
     sys_info::cpu_num().unwrap_or(1) as u32
 }
 
+#[cfg(target_os = "windows")]
+fn get_process_working_set_bytes() -> Option<usize> {
+    let pid = std::process::id();
+    let script = format!(
+        "Get-Process -Id {} | Select-Object -ExpandProperty WorkingSet64",
+        pid
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim().parse::<usize>().ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_process_working_set_bytes() -> Option<usize> {
+    let pid = std::process::id();
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "rss="])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let kb = stdout.trim().parse::<usize>().ok()?;
+    Some(kb * 1024)
+}
+
 fn main() {
     let args = Args::parse();
     let running = Arc::new(AtomicBool::new(true));
@@ -198,24 +235,30 @@ fn main() {
 
             let total_memory = get_total_memory();
             let available_memory = get_available_memory();
-            let current_mem_usage = memory_consumer.get_current_usage();
+            let allocated_mem_usage = memory_consumer.get_current_usage();
+
+            let pages_to_touch = ((allocated_mem_usage / 4096) / 8).clamp(64, 8192);
+            memory_consumer.touch_pages(pages_to_touch);
+
+            let actual_mem_usage = get_process_working_set_bytes().unwrap_or(allocated_mem_usage);
 
             let cpu_percent = cpu_target_arc
                 .as_ref()
                 .map(|arc| arc.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            let mem_gb = current_mem_usage as f64 / (1024.0 * 1024.0 * 1024.0);
+            let mem_gb = actual_mem_usage as f64 / (1024.0 * 1024.0 * 1024.0);
+            let alloc_mem_gb = allocated_mem_usage as f64 / (1024.0 * 1024.0 * 1024.0);
             let total_mem_gb = total_memory as f64 / (1024.0 * 1024.0 * 1024.0);
             let mem_percent = if total_memory > 0 {
-                let pct = current_mem_usage as f64 / total_memory as f64 * 100.0;
+                let pct = actual_mem_usage as f64 / total_memory as f64 * 100.0;
                 pct.round() as u32
             } else {
                 0
             };
 
             println!(
-                "[Running] CPU: {}% | MEM: {:.2} GB / {:.2} GB ({}%)",
-                cpu_percent, mem_gb, total_mem_gb, mem_percent
+                "[Running] CPU: {}% | MEM(actual): {:.2} GB / {:.2} GB ({}%) | MEM(alloc): {:.2} GB",
+                cpu_percent, mem_gb, total_mem_gb, mem_percent, alloc_mem_gb
             );
 
             if let Some(ref cpu_arc) = &cpu_target_arc {
@@ -228,20 +271,49 @@ fn main() {
 
             match &memory_target {
                 MemoryTarget::Dynamic(percent) => {
-                    let target_bytes = (total_memory as f64 * percent / 100.0) as usize;
-                    if current_mem_usage != target_bytes {
-                        memory_consumer.adjust_to(target_bytes, Arc::clone(&running));
+                    let mut target_bytes = (total_memory as f64 * percent / 100.0) as usize;
+                    let safe_cap = (available_memory as f64 * 0.9) as usize;
+                    target_bytes = target_bytes.min(safe_cap.max(64 * 1024 * 1024));
+
+                    let low_watermark = (target_bytes as f64 * 0.90) as usize;
+                    let high_watermark = (target_bytes as f64 * 1.05) as usize;
+
+                    if actual_mem_usage < low_watermark {
+                        let gap = target_bytes.saturating_sub(actual_mem_usage);
+                        let add_step = gap.max(16 * 1024 * 1024);
+                        let new_target = allocated_mem_usage
+                            .saturating_add(add_step)
+                            .min(target_bytes);
+                        if new_target > allocated_mem_usage {
+                            memory_consumer.adjust_to(new_target, Arc::clone(&running));
+                        }
+                    } else if actual_mem_usage > high_watermark {
+                        let release_target = (target_bytes as f64 * 1.02) as usize;
+                        memory_consumer.adjust_to(release_target, Arc::clone(&running));
                     }
                 }
                 MemoryTarget::Fixed(target_bytes) => {
                     if available_memory < total_memory / 10 {
                         println!("Warning: Low memory, releasing 20%");
                         memory_consumer.release_percent(20, Arc::clone(&running));
-                    } else if current_mem_usage < *target_bytes {
-                        let deficit = target_bytes - current_mem_usage;
-                        let add_amount = (deficit / 10).min(available_memory / 2);
-                        memory_consumer
-                            .adjust_to(current_mem_usage + add_amount, Arc::clone(&running));
+                    } else {
+                        let low_watermark = (*target_bytes as f64 * 0.90) as usize;
+                        let high_watermark = (*target_bytes as f64 * 1.05) as usize;
+
+                        if actual_mem_usage < low_watermark {
+                            let deficit = target_bytes.saturating_sub(actual_mem_usage);
+                            let add_amount =
+                                deficit.max(16 * 1024 * 1024).min(available_memory / 2);
+                            let new_target = allocated_mem_usage
+                                .saturating_add(add_amount)
+                                .min(*target_bytes);
+                            if new_target > allocated_mem_usage {
+                                memory_consumer.adjust_to(new_target, Arc::clone(&running));
+                            }
+                        } else if actual_mem_usage > high_watermark {
+                            let release_target = (*target_bytes as f64 * 1.02) as usize;
+                            memory_consumer.adjust_to(release_target, Arc::clone(&running));
+                        }
                     }
                 }
                 _ => {}

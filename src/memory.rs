@@ -3,11 +3,17 @@ use std::sync::Arc;
 
 pub struct MemoryConsumer {
     data: Vec<Vec<u8>>,
+    touch_chunk_idx: usize,
+    touch_offset: usize,
 }
 
 impl MemoryConsumer {
     pub fn new() -> Self {
-        Self { data: Vec::new() }
+        Self {
+            data: Vec::new(),
+            touch_chunk_idx: 0,
+            touch_offset: 0,
+        }
     }
 
     pub fn get_current_usage(&self) -> usize {
@@ -61,6 +67,44 @@ impl MemoryConsumer {
         let to_release = current * percent as usize / 100;
         let new_target = current.saturating_sub(to_release);
         self.adjust_to(new_target, running);
+    }
+
+    pub fn touch_pages(&mut self, pages_to_touch: usize) {
+        if pages_to_touch == 0 || self.data.is_empty() {
+            return;
+        }
+
+        const PAGE_SIZE: usize = 4096;
+
+        for _ in 0..pages_to_touch {
+            if self.data.is_empty() {
+                self.touch_chunk_idx = 0;
+                self.touch_offset = 0;
+                return;
+            }
+
+            if self.touch_chunk_idx >= self.data.len() {
+                self.touch_chunk_idx = 0;
+                self.touch_offset = 0;
+            }
+
+            let chunk_len = self.data[self.touch_chunk_idx].len();
+            if chunk_len == 0 {
+                self.touch_chunk_idx = (self.touch_chunk_idx + 1) % self.data.len();
+                self.touch_offset = 0;
+                continue;
+            }
+
+            if self.touch_offset >= chunk_len {
+                self.touch_chunk_idx = (self.touch_chunk_idx + 1) % self.data.len();
+                self.touch_offset = 0;
+                continue;
+            }
+
+            let byte = &mut self.data[self.touch_chunk_idx][self.touch_offset];
+            *byte = byte.wrapping_add(1);
+            self.touch_offset += PAGE_SIZE;
+        }
     }
 }
 
