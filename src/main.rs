@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const ADJUST_INTERVAL_SECS: u64 = 5;
+const TOUCH_INTERVAL_MILLIS: u64 = 1000;
 
 #[derive(Debug, Clone)]
 enum CpuTarget {
@@ -31,7 +32,7 @@ struct Args {
     #[arg(short = 'm', long, default_value = "0")]
     memory: String,
 
-    #[arg(short, long, default_value = "1")]
+    #[arg(short, long, default_value = "0")]
     duration: u64,
 }
 
@@ -219,9 +220,19 @@ fn main() {
     };
 
     let mut last_adjust = std::time::Instant::now();
+    let mut last_touch = std::time::Instant::now();
 
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(100));
+
+        if last_touch.elapsed() >= std::time::Duration::from_millis(TOUCH_INTERVAL_MILLIS) {
+            last_touch = std::time::Instant::now();
+            let allocated_mem_usage = memory_consumer.get_current_usage();
+            if allocated_mem_usage > 0 {
+                let pages_to_touch = ((allocated_mem_usage / 4096) / 8).clamp(256, 65_536);
+                memory_consumer.touch_pages(pages_to_touch);
+            }
+        }
 
         if let Some(t) = timeout {
             if start.elapsed() >= t {
@@ -236,9 +247,6 @@ fn main() {
             let total_memory = get_total_memory();
             let available_memory = get_available_memory();
             let allocated_mem_usage = memory_consumer.get_current_usage();
-
-            let pages_to_touch = ((allocated_mem_usage / 4096) / 8).clamp(64, 8192);
-            memory_consumer.touch_pages(pages_to_touch);
 
             let actual_mem_usage = get_process_working_set_bytes().unwrap_or(allocated_mem_usage);
 
@@ -276,19 +284,21 @@ fn main() {
                     target_bytes = target_bytes.min(safe_cap.max(64 * 1024 * 1024));
 
                     let low_watermark = (target_bytes as f64 * 0.90) as usize;
-                    let high_watermark = (target_bytes as f64 * 1.05) as usize;
+                    let high_watermark = (target_bytes as f64 * 1.10) as usize;
+                    let boost_limit = (target_bytes as f64 * 1.20) as usize;
 
                     if actual_mem_usage < low_watermark {
                         let gap = target_bytes.saturating_sub(actual_mem_usage);
                         let add_step = gap.max(16 * 1024 * 1024);
                         let new_target = allocated_mem_usage
                             .saturating_add(add_step)
-                            .min(target_bytes);
+                            .min(boost_limit)
+                            .min(allocated_mem_usage.saturating_add(available_memory / 2));
                         if new_target > allocated_mem_usage {
                             memory_consumer.adjust_to(new_target, Arc::clone(&running));
                         }
                     } else if actual_mem_usage > high_watermark {
-                        let release_target = (target_bytes as f64 * 1.02) as usize;
+                        let release_target = (target_bytes as f64 * 1.05) as usize;
                         memory_consumer.adjust_to(release_target, Arc::clone(&running));
                     }
                 }
@@ -298,7 +308,8 @@ fn main() {
                         memory_consumer.release_percent(20, Arc::clone(&running));
                     } else {
                         let low_watermark = (*target_bytes as f64 * 0.90) as usize;
-                        let high_watermark = (*target_bytes as f64 * 1.05) as usize;
+                        let high_watermark = (*target_bytes as f64 * 1.10) as usize;
+                        let boost_limit = (*target_bytes as f64 * 1.20) as usize;
 
                         if actual_mem_usage < low_watermark {
                             let deficit = target_bytes.saturating_sub(actual_mem_usage);
@@ -306,12 +317,13 @@ fn main() {
                                 deficit.max(16 * 1024 * 1024).min(available_memory / 2);
                             let new_target = allocated_mem_usage
                                 .saturating_add(add_amount)
-                                .min(*target_bytes);
+                                .min(boost_limit)
+                                .min(allocated_mem_usage.saturating_add(available_memory / 2));
                             if new_target > allocated_mem_usage {
                                 memory_consumer.adjust_to(new_target, Arc::clone(&running));
                             }
                         } else if actual_mem_usage > high_watermark {
-                            let release_target = (*target_bytes as f64 * 1.02) as usize;
+                            let release_target = (*target_bytes as f64 * 1.05) as usize;
                             memory_consumer.adjust_to(release_target, Arc::clone(&running));
                         }
                     }
