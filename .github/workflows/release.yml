@@ -53,9 +53,34 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}.*
 
+  docker-image:
+    name: Build Docker image archive
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: docker buildx build --platform linux/amd64 --load -t mem:latest .
+
+      - name: Export Docker image
+        run: docker save mem:latest | gzip > mem-docker-linux-amd64.tar.gz
+
+      - name: Upload Docker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mem-docker-linux-amd64
+          path: mem-docker-linux-amd64.tar.gz
+
   release:
     name: Create Release
-    needs: build
+    needs:
+      - build
+      - docker-image
     runs-on: ubuntu-latest
     permissions:
       contents: write

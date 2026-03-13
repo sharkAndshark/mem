@@ -34,3 +34,28 @@ The process runs continuously until `Ctrl-C`.
 ```bash
 cargo build --release
 ```
+
+## Docker
+
+Use Docker if the host machine reports `GLIBC_x.y not found`.
+
+Build the image:
+
+```bash
+docker build -t mem .
+```
+
+Run with custom targets:
+
+```bash
+docker run --rm -it mem -c 50% -m 60%
+```
+
+Stop with `Ctrl-C`.
+
+If you download the Docker image from GitHub Releases instead of building locally:
+
+```bash
+docker load -i mem-docker-linux-amd64.tar.gz
+docker run --rm -it mem -c 50% -m 60%
+```
