@@ -1,340 +1,137 @@
 mod cpu;
 mod memory;
+mod metrics;
 
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-const ADJUST_INTERVAL_SECS: u64 = 5;
-const TOUCH_INTERVAL_MILLIS: u64 = 1000;
-
-#[derive(Debug, Clone)]
-enum CpuTarget {
-    Fixed(u32),
-    Dynamic(f64),
-    None,
-}
-
-#[derive(Debug, Clone)]
-enum MemoryTarget {
-    Fixed(usize),
-    Dynamic(f64),
-    None,
-}
+const STATUS_INTERVAL_SECS: u64 = 5;
 
 #[derive(Parser, Debug)]
 #[command(name = "mem")]
-#[command(about = "Consume CPU and memory resources", long_about = None)]
+#[command(about = "Dynamic CPU/Memory stress tool (Linux/Windows)")]
 struct Args {
-    #[arg(short, long, default_value = "1")]
+    #[arg(short, long, value_name = "PERCENT")]
     cpu: String,
 
-    #[arg(short = 'm', long, default_value = "0")]
+    #[arg(short, long, value_name = "PERCENT")]
     memory: String,
-
-    #[arg(short, long, default_value = "0")]
-    duration: u64,
 }
 
-fn parse_cpu(s: &str) -> CpuTarget {
-    let s = s.trim();
-    if s.is_empty() || s == "0" {
-        return CpuTarget::None;
-    }
-
-    if let Some(num_str) = s.strip_suffix('%') {
-        if let Ok(percent) = num_str.parse::<f64>() {
-            if percent > 0.0 && percent <= 100.0 {
-                return CpuTarget::Dynamic(percent);
-            }
-        }
-    }
-
-    if let Ok(fixed) = s.parse::<u32>() {
-        if fixed > 0 {
-            return CpuTarget::Fixed(fixed);
-        }
-    }
-
-    CpuTarget::None
-}
-
-fn parse_memory(s: &str) -> MemoryTarget {
-    let s = s.trim().to_uppercase();
-    if s.is_empty() || s == "0" {
-        return MemoryTarget::None;
-    }
-
-    if let Some(num_str) = s.strip_suffix('%') {
-        if let Ok(percent) = num_str.parse::<f64>() {
-            if percent > 0.0 && percent <= 100.0 {
-                return MemoryTarget::Dynamic(percent);
-            }
-        }
-    }
-
-    let (num_str, mult) = if let Some(num) = s.strip_suffix("GB") {
-        (num, 1024 * 1024 * 1024)
-    } else if let Some(num) = s.strip_suffix('G') {
-        (num, 1024 * 1024 * 1024)
-    } else if let Some(num) = s.strip_suffix("MB") {
-        (num, 1024 * 1024)
-    } else if let Some(num) = s.strip_suffix('M') {
-        (num, 1024 * 1024)
-    } else if let Some(num) = s.strip_suffix("KB") {
-        (num, 1024)
-    } else if let Some(num) = s.strip_suffix('K') {
-        (num, 1024)
+fn parse_percent(input: &str) -> Option<u32> {
+    let s = input.trim();
+    let value = s.strip_suffix('%')?.trim().parse::<u32>().ok()?;
+    if value <= 100 {
+        Some(value)
     } else {
-        (s.as_str(), 1)
-    };
-
-    MemoryTarget::Fixed(num_str.parse::<usize>().unwrap_or(0) * mult)
+        None
+    }
 }
 
-fn get_total_memory() -> usize {
+fn bytes_to_gb(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn get_total_memory_bytes() -> usize {
     sys_info::mem_info()
         .map(|m| m.total as usize * 1024)
-        .unwrap_or(16 * 1024 * 1024 * 1024)
-}
-
-fn get_available_memory() -> usize {
-    sys_info::mem_info()
-        .map(|m| m.avail as usize * 1024)
         .unwrap_or(8 * 1024 * 1024 * 1024)
-}
-
-fn get_cpu_cores() -> u32 {
-    sys_info::cpu_num().unwrap_or(1) as u32
-}
-
-#[cfg(target_os = "windows")]
-fn get_process_working_set_bytes() -> Option<usize> {
-    let pid = std::process::id();
-    let script = format!(
-        "Get-Process -Id {} | Select-Object -ExpandProperty WorkingSet64",
-        pid
-    );
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim().parse::<usize>().ok()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn get_process_working_set_bytes() -> Option<usize> {
-    let pid = std::process::id();
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "rss="])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let kb = stdout.trim().parse::<usize>().ok()?;
-    Some(kb * 1024)
 }
 
 fn main() {
     let args = Args::parse();
+
+    let cpu_percent = match parse_percent(&args.cpu) {
+        Some(v) => v,
+        None => {
+            eprintln!("Invalid CPU percent '{}'. Use format like -c 50%", args.cpu);
+            std::process::exit(2);
+        }
+    };
+
+    let memory_percent = match parse_percent(&args.memory) {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "Invalid memory percent '{}'. Use format like -m 60%",
+                args.memory
+            );
+            std::process::exit(2);
+        }
+    };
+
     let running = Arc::new(AtomicBool::new(true));
-    let r = Arc::clone(&running);
-
+    let signal_flag = Arc::clone(&running);
     ctrlc::set_handler(move || {
-        r.store(false, Ordering::Relaxed);
+        signal_flag.store(false, Ordering::Relaxed);
     })
-    .expect("Error setting Ctrl-C handler");
+    .expect("failed to set Ctrl-C handler");
 
-    let cpu_target = parse_cpu(&args.cpu);
-    let memory_target = parse_memory(&args.memory);
+    let total_memory = get_total_memory_bytes();
+    let target_memory = total_memory.saturating_mul(memory_percent as usize) / 100;
 
-    let cpu_cores = get_cpu_cores();
-    let total_memory = get_total_memory();
+    let cpu_controller = cpu::CpuController::new(cpu_percent, Arc::clone(&running));
+    cpu_controller.set_target_percent(cpu_percent);
+    cpu_controller.start();
+
+    let mut memory_controller = memory::MemoryController::new(target_memory);
+    memory_controller.set_target(target_memory);
 
     println!(
-        "System: {} CPU cores, {} GB memory",
-        cpu_cores,
-        total_memory / (1024 * 1024 * 1024)
+        "Start: CPU target {}%, MEM target {}% ({:.2} GB)",
+        cpu_percent,
+        memory_percent,
+        bytes_to_gb(target_memory)
     );
     println!("Press Ctrl-C to stop");
-    println!();
 
-    let cpu_target_arc = match &cpu_target {
-        CpuTarget::Fixed(percent) => {
-            println!("CPU: fixed {}%", percent);
-            Some(cpu::consume(*percent, Arc::clone(&running)))
-        }
-        CpuTarget::Dynamic(percent) => {
-            println!("CPU: dynamic {}%", percent);
-            let target = (*percent * cpu_cores as f64).min(cpu_cores as f64 * 100.0) as u32;
-            let arc = cpu::consume(target, Arc::clone(&running));
-            Some(arc)
-        }
-        CpuTarget::None => {
-            println!("CPU: none");
-            None
-        }
-    };
-
-    let mut memory_consumer = memory::MemoryConsumer::new();
-
-    match &memory_target {
-        MemoryTarget::Fixed(bytes) => {
-            println!(
-                "Memory: fixed {} bytes ({:.2} GB)",
-                bytes,
-                *bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-            );
-            memory_consumer.consume(*bytes, Arc::clone(&running));
-        }
-        MemoryTarget::Dynamic(percent) => {
-            println!("Memory: dynamic {}%", percent);
-            let target_bytes = (total_memory as f64 * percent / 100.0) as usize;
-            println!(
-                "  Initial target: {} bytes ({:.2} GB)",
-                target_bytes,
-                target_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-            );
-            memory_consumer.consume(target_bytes, Arc::clone(&running));
-        }
-        MemoryTarget::None => {
-            println!("Memory: none");
-        }
-    }
-
-    let start = std::time::Instant::now();
-    let timeout = if args.duration > 0 {
-        Some(std::time::Duration::from_secs(args.duration))
-    } else {
-        None
-    };
-
-    let mut last_adjust = std::time::Instant::now();
-    let mut last_touch = std::time::Instant::now();
+    let mut last_status = Instant::now();
+    let mut last_cpu_sample_at = Instant::now();
+    let mut last_cpu_micros = metrics::process_cpu_time_micros().unwrap_or(0);
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get() as f64)
+        .unwrap_or(1.0)
+        .max(1.0);
 
     while running.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(250));
 
-        if last_touch.elapsed() >= std::time::Duration::from_millis(TOUCH_INTERVAL_MILLIS) {
-            last_touch = std::time::Instant::now();
-            let allocated_mem_usage = memory_consumer.get_current_usage();
-            if allocated_mem_usage > 0 {
-                let pages_to_touch = ((allocated_mem_usage / 4096) / 8).clamp(256, 65_536);
-                memory_consumer.touch_pages(pages_to_touch);
+        let observed_private =
+            metrics::process_private_bytes().unwrap_or_else(|| memory_controller.allocated_bytes());
+        memory_controller.step(observed_private, Arc::clone(&running));
+        memory_controller.touch_hot_pages();
+
+        if last_cpu_sample_at.elapsed() >= Duration::from_secs(1) {
+            let now_cpu_micros = metrics::process_cpu_time_micros().unwrap_or(last_cpu_micros);
+            let delta_cpu = now_cpu_micros.saturating_sub(last_cpu_micros) as f64;
+            let elapsed_wall = last_cpu_sample_at.elapsed().as_micros() as f64;
+            if elapsed_wall > 0.0 {
+                let observed_percent = (delta_cpu / elapsed_wall / cpu_count) * 100.0;
+                cpu_controller.update_from_observed(observed_percent);
             }
+            last_cpu_micros = now_cpu_micros;
+            last_cpu_sample_at = Instant::now();
         }
 
-        if let Some(t) = timeout {
-            if start.elapsed() >= t {
-                println!("\nDuration timeout");
-                running.store(false, Ordering::Relaxed);
-            }
-        }
-
-        if last_adjust.elapsed() >= std::time::Duration::from_secs(ADJUST_INTERVAL_SECS) {
-            last_adjust = std::time::Instant::now();
-
-            let total_memory = get_total_memory();
-            let available_memory = get_available_memory();
-            let allocated_mem_usage = memory_consumer.get_current_usage();
-
-            let actual_mem_usage = get_process_working_set_bytes().unwrap_or(allocated_mem_usage);
-
-            let cpu_percent = cpu_target_arc
-                .as_ref()
-                .map(|arc| arc.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let mem_gb = actual_mem_usage as f64 / (1024.0 * 1024.0 * 1024.0);
-            let alloc_mem_gb = allocated_mem_usage as f64 / (1024.0 * 1024.0 * 1024.0);
-            let total_mem_gb = total_memory as f64 / (1024.0 * 1024.0 * 1024.0);
-            let mem_percent = if total_memory > 0 {
-                let pct = actual_mem_usage as f64 / total_memory as f64 * 100.0;
-                pct.round() as u32
-            } else {
-                0
-            };
+        if last_status.elapsed() >= Duration::from_secs(STATUS_INTERVAL_SECS) {
+            last_status = Instant::now();
+            let actual = metrics::process_private_bytes().unwrap_or(observed_private);
+            let alloc = memory_controller.allocated_bytes();
 
             println!(
-                "[Running] CPU: {}% | MEM(actual): {:.2} GB / {:.2} GB ({}%) | MEM(alloc): {:.2} GB",
-                cpu_percent, mem_gb, total_mem_gb, mem_percent, alloc_mem_gb
+                "[Running] CPU target: {}% | CPU duty: {}% | MEM private: {:.2} GB ({:.0}%) | MEM alloc: {:.2} GB",
+                cpu_controller.get_target_percent(),
+                cpu_controller.get_duty_percent(),
+                bytes_to_gb(actual),
+                (actual as f64 / total_memory as f64 * 100.0).round(),
+                bytes_to_gb(alloc)
             );
-
-            if let Some(ref cpu_arc) = &cpu_target_arc {
-                if let CpuTarget::Dynamic(percent) = &cpu_target {
-                    let target_percent =
-                        (*percent * cpu_cores as f64).min(cpu_cores as f64 * 100.0) as u32;
-                    cpu_arc.store(target_percent, Ordering::Relaxed);
-                }
-            }
-
-            match &memory_target {
-                MemoryTarget::Dynamic(percent) => {
-                    let mut target_bytes = (total_memory as f64 * percent / 100.0) as usize;
-                    let safe_cap = (available_memory as f64 * 0.9) as usize;
-                    target_bytes = target_bytes.min(safe_cap.max(64 * 1024 * 1024));
-
-                    let low_watermark = (target_bytes as f64 * 0.90) as usize;
-                    let high_watermark = (target_bytes as f64 * 1.10) as usize;
-                    let boost_limit = (target_bytes as f64 * 1.20) as usize;
-
-                    if actual_mem_usage < low_watermark {
-                        let gap = target_bytes.saturating_sub(actual_mem_usage);
-                        let add_step = gap.max(16 * 1024 * 1024);
-                        let new_target = allocated_mem_usage
-                            .saturating_add(add_step)
-                            .min(boost_limit)
-                            .min(allocated_mem_usage.saturating_add(available_memory / 2));
-                        if new_target > allocated_mem_usage {
-                            memory_consumer.adjust_to(new_target, Arc::clone(&running));
-                        }
-                    } else if actual_mem_usage > high_watermark {
-                        let release_target = (target_bytes as f64 * 1.05) as usize;
-                        memory_consumer.adjust_to(release_target, Arc::clone(&running));
-                    }
-                }
-                MemoryTarget::Fixed(target_bytes) => {
-                    if available_memory < total_memory / 10 {
-                        println!("Warning: Low memory, releasing 20%");
-                        memory_consumer.release_percent(20, Arc::clone(&running));
-                    } else {
-                        let low_watermark = (*target_bytes as f64 * 0.90) as usize;
-                        let high_watermark = (*target_bytes as f64 * 1.10) as usize;
-                        let boost_limit = (*target_bytes as f64 * 1.20) as usize;
-
-                        if actual_mem_usage < low_watermark {
-                            let deficit = target_bytes.saturating_sub(actual_mem_usage);
-                            let add_amount =
-                                deficit.max(16 * 1024 * 1024).min(available_memory / 2);
-                            let new_target = allocated_mem_usage
-                                .saturating_add(add_amount)
-                                .min(boost_limit)
-                                .min(allocated_mem_usage.saturating_add(available_memory / 2));
-                            if new_target > allocated_mem_usage {
-                                memory_consumer.adjust_to(new_target, Arc::clone(&running));
-                            }
-                        } else if actual_mem_usage > high_watermark {
-                            let release_target = (*target_bytes as f64 * 1.05) as usize;
-                            memory_consumer.adjust_to(release_target, Arc::clone(&running));
-                        }
-                    }
-                }
-                _ => {}
-            }
         }
     }
 
-    drop(memory_consumer);
-    println!("\nStopped.");
+    println!("Stopped.");
 }
 
 #[cfg(test)]
@@ -342,112 +139,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_cpu_fixed() {
-        assert!(matches!(parse_cpu("100"), CpuTarget::Fixed(100)));
-        assert!(matches!(parse_cpu("200"), CpuTarget::Fixed(200)));
-        assert!(matches!(parse_cpu("1"), CpuTarget::Fixed(1)));
+    fn test_parse_percent_valid() {
+        assert_eq!(parse_percent("0%"), Some(0));
+        assert_eq!(parse_percent("50%"), Some(50));
+        assert_eq!(parse_percent("100%"), Some(100));
+        assert_eq!(parse_percent(" 25% "), Some(25));
     }
 
     #[test]
-    fn test_parse_cpu_dynamic() {
-        match parse_cpu("50%") {
-            CpuTarget::Dynamic(p) => assert!((p - 50.0).abs() < 0.01),
-            _ => panic!("Expected Dynamic"),
-        }
-        match parse_cpu("100%") {
-            CpuTarget::Dynamic(p) => assert!((p - 100.0).abs() < 0.01),
-            _ => panic!("Expected Dynamic"),
-        }
-        match parse_cpu("25.5%") {
-            CpuTarget::Dynamic(p) => assert!((p - 25.5).abs() < 0.01),
-            _ => panic!("Expected Dynamic"),
-        }
-    }
-
-    #[test]
-    fn test_parse_cpu_invalid_or_none() {
-        assert!(matches!(parse_cpu("0"), CpuTarget::None));
-        assert!(matches!(parse_cpu("000"), CpuTarget::None));
-        assert!(matches!(parse_cpu(""), CpuTarget::None));
-        assert!(matches!(parse_cpu("   "), CpuTarget::None));
-        assert!(matches!(parse_cpu("invalid"), CpuTarget::None));
-        assert!(matches!(parse_cpu("abc%"), CpuTarget::None));
-        assert!(matches!(parse_cpu("0%"), CpuTarget::None));
-        assert!(matches!(parse_cpu("150%"), CpuTarget::None));
-        assert!(matches!(parse_cpu("-50%"), CpuTarget::None));
-    }
-
-    #[test]
-    fn test_parse_cpu_trim() {
-        match parse_cpu("  50%  ") {
-            CpuTarget::Dynamic(p) => assert!((p - 50.0).abs() < 0.01),
-            _ => panic!("Expected Dynamic"),
-        }
-    }
-
-    #[test]
-    fn test_parse_memory_fixed_units() {
-        match parse_memory("2GB") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-        match parse_memory("512MB") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 512 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-        match parse_memory("1024KB") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-        match parse_memory("1024") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 1024),
-            _ => panic!("Expected Fixed"),
-        }
-    }
-
-    #[test]
-    fn test_parse_memory_dynamic() {
-        match parse_memory("50%") {
-            MemoryTarget::Dynamic(p) => assert!((p - 50.0).abs() < 0.01),
-            _ => panic!("Expected Dynamic"),
-        }
-        match parse_memory("100%") {
-            MemoryTarget::Dynamic(p) => assert!((p - 100.0).abs() < 0.01),
-            _ => panic!("Expected Dynamic"),
-        }
-    }
-
-    #[test]
-    fn test_parse_memory_invalid_or_none() {
-        assert!(matches!(parse_memory("0"), MemoryTarget::None));
-        assert!(matches!(parse_memory("000"), MemoryTarget::Fixed(0)));
-        assert!(matches!(parse_memory(""), MemoryTarget::None));
-        assert!(matches!(parse_memory("   "), MemoryTarget::None));
-        assert!(matches!(parse_memory("150%"), MemoryTarget::Fixed(0)));
-
-        match parse_memory("abc") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
-            _ => panic!("Expected Fixed with 0"),
-        }
-        match parse_memory("1TB") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
-            _ => panic!("Expected Fixed with 0"),
-        }
-        match parse_memory("-100M") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 0),
-            _ => panic!("Expected Fixed with 0"),
-        }
-    }
-
-    #[test]
-    fn test_parse_memory_case_insensitive_and_trim() {
-        match parse_memory("2gb") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
-        match parse_memory("  2Gb  ") {
-            MemoryTarget::Fixed(bytes) => assert_eq!(bytes, 2 * 1024 * 1024 * 1024),
-            _ => panic!("Expected Fixed"),
-        }
+    fn test_parse_percent_invalid() {
+        assert_eq!(parse_percent("101%"), None);
+        assert_eq!(parse_percent("50"), None);
+        assert_eq!(parse_percent("abc%"), None);
+        assert_eq!(parse_percent("-1%"), None);
     }
 }

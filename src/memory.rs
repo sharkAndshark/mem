@@ -1,109 +1,129 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub struct MemoryConsumer {
-    data: Vec<Vec<u8>>,
+const CHUNK_SIZE: usize = 1024 * 1024;
+const MIN_STEP: usize = 16 * 1024 * 1024;
+const MAX_BOOST_FACTOR: f64 = 1.12;
+
+pub struct MemoryController {
+    target_bytes: usize,
+    chunks: Vec<Vec<u8>>,
     touch_chunk_idx: usize,
     touch_offset: usize,
+    max_allocated_bytes: usize,
 }
 
-impl MemoryConsumer {
-    pub fn new() -> Self {
+impl MemoryController {
+    pub fn new(target_bytes: usize) -> Self {
         Self {
-            data: Vec::new(),
+            target_bytes,
+            chunks: Vec::new(),
             touch_chunk_idx: 0,
             touch_offset: 0,
+            max_allocated_bytes: target_bytes.max(MIN_STEP),
         }
     }
 
-    pub fn get_current_usage(&self) -> usize {
-        self.data.iter().map(|chunk| chunk.len()).sum()
+    pub fn set_target(&mut self, target_bytes: usize) {
+        self.target_bytes = target_bytes;
+        self.max_allocated_bytes = target_bytes.max(MIN_STEP);
     }
 
-    pub fn consume(&mut self, bytes: usize, running: Arc<AtomicBool>) {
-        self.adjust_to(bytes, running);
+    pub fn allocated_bytes(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
     }
 
-    pub fn adjust_to(&mut self, target_bytes: usize, running: Arc<AtomicBool>) {
-        let current = self.get_current_usage();
-
-        if target_bytes > current {
-            let to_add = target_bytes - current;
-            let chunk_size = 1024 * 1024;
-            let chunks = to_add / chunk_size;
-            let remainder = to_add % chunk_size;
-
-            for _ in 0..chunks {
-                if !running.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut chunk = Vec::with_capacity(chunk_size);
-                chunk.resize(chunk_size, 0xAA);
-                self.data.push(chunk);
-            }
-
-            if remainder > 0 && running.load(Ordering::Relaxed) {
-                let mut chunk = Vec::with_capacity(remainder);
-                chunk.resize(remainder, 0xAA);
-                self.data.push(chunk);
-            }
-        } else if target_bytes < current {
-            let to_release = current - target_bytes;
-            let mut released = 0;
-
-            while released < to_release && !self.data.is_empty() {
-                if !running.load(Ordering::Relaxed) {
-                    return;
-                }
-                if let Some(chunk) = self.data.pop() {
-                    released += chunk.len();
-                }
-            }
-        }
-    }
-
-    pub fn release_percent(&mut self, percent: u32, running: Arc<AtomicBool>) {
-        let current = self.get_current_usage();
-        let to_release = current * percent as usize / 100;
-        let new_target = current.saturating_sub(to_release);
-        self.adjust_to(new_target, running);
-    }
-
-    pub fn touch_pages(&mut self, pages_to_touch: usize) {
-        if pages_to_touch == 0 || self.data.is_empty() {
+    pub fn step(&mut self, observed_private_bytes: usize, running: Arc<AtomicBool>) {
+        let target = self.target_bytes;
+        if target == 0 {
+            self.adjust_to(0, running);
             return;
         }
 
+        let low = (target as f64 * 0.97) as usize;
+        let high = (target as f64 * 1.03) as usize;
+        let alloc_ceiling = (target as f64 * MAX_BOOST_FACTOR) as usize;
+        let current_alloc = self.allocated_bytes();
+
+        if observed_private_bytes < low {
+            let gap = target.saturating_sub(observed_private_bytes);
+            let add = (gap / 2).max(MIN_STEP).min(target / 10 + MIN_STEP);
+            self.max_allocated_bytes = self
+                .max_allocated_bytes
+                .max(current_alloc)
+                .saturating_add(add)
+                .min(alloc_ceiling);
+            let new_target = self.max_allocated_bytes;
+            self.adjust_to(new_target, running);
+        } else if observed_private_bytes > high {
+            let release_to = (target as f64 * 1.01) as usize;
+            self.max_allocated_bytes = target;
+            self.adjust_to(release_to, running);
+        } else {
+            self.max_allocated_bytes = self.max_allocated_bytes.min(target);
+            if current_alloc > target {
+                self.adjust_to(target, running);
+            }
+        }
+    }
+
+    pub fn touch_hot_pages(&mut self) {
+        if self.chunks.is_empty() {
+            return;
+        }
+
+        let total_bytes = self.allocated_bytes();
+        let pages_to_touch = ((total_bytes / 4096) / 4).clamp(256, 131072);
         const PAGE_SIZE: usize = 4096;
 
         for _ in 0..pages_to_touch {
-            if self.data.is_empty() {
+            if self.chunks.is_empty() {
                 self.touch_chunk_idx = 0;
                 self.touch_offset = 0;
                 return;
             }
 
-            if self.touch_chunk_idx >= self.data.len() {
+            if self.touch_chunk_idx >= self.chunks.len() {
                 self.touch_chunk_idx = 0;
                 self.touch_offset = 0;
             }
 
-            let chunk_len = self.data[self.touch_chunk_idx].len();
-            if chunk_len == 0 {
-                self.touch_chunk_idx = (self.touch_chunk_idx + 1) % self.data.len();
+            let len = self.chunks[self.touch_chunk_idx].len();
+            if len == 0 {
+                self.touch_chunk_idx = (self.touch_chunk_idx + 1) % self.chunks.len();
                 self.touch_offset = 0;
                 continue;
             }
 
-            if self.touch_offset >= chunk_len {
-                self.touch_chunk_idx = (self.touch_chunk_idx + 1) % self.data.len();
+            if self.touch_offset >= len {
+                self.touch_chunk_idx = (self.touch_chunk_idx + 1) % self.chunks.len();
                 self.touch_offset = 0;
                 continue;
             }
 
-            let byte = &mut self.data[self.touch_chunk_idx][self.touch_offset];
-            *byte = byte.wrapping_add(1);
+            let b = &mut self.chunks[self.touch_chunk_idx][self.touch_offset];
+            *b = b.wrapping_add(1);
             self.touch_offset += PAGE_SIZE;
+        }
+    }
+
+    fn adjust_to(&mut self, target_bytes: usize, running: Arc<AtomicBool>) {
+        let mut current = self.allocated_bytes();
+
+        while current < target_bytes && running.load(Ordering::Relaxed) {
+            let remaining = target_bytes - current;
+            let this_chunk = remaining.min(CHUNK_SIZE);
+
+            let mut chunk = Vec::with_capacity(this_chunk);
+            chunk.resize(this_chunk, 0xAA);
+            self.chunks.push(chunk);
+            current += this_chunk;
+        }
+
+        while current > target_bytes && !self.chunks.is_empty() && running.load(Ordering::Relaxed) {
+            if let Some(chunk) = self.chunks.pop() {
+                current = current.saturating_sub(chunk.len());
+            }
         }
     }
 }
@@ -112,163 +132,43 @@ impl MemoryConsumer {
 mod tests {
     use super::*;
 
-    fn create_running_flag() -> Arc<AtomicBool> {
+    fn running() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(true))
     }
 
     #[test]
-    fn test_new_consumer_has_zero_usage() {
-        let consumer = MemoryConsumer::new();
-        assert_eq!(consumer.get_current_usage(), 0);
+    fn test_zero_target_releases_all() {
+        let mut c = MemoryController::new(50 * 1024 * 1024);
+        c.adjust_to(50 * 1024 * 1024, running());
+        assert!(c.allocated_bytes() > 0);
+        c.set_target(0);
+        c.step(0, running());
+        assert_eq!(c.allocated_bytes(), 0);
     }
 
     #[test]
-    fn test_consume_10mb() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-        let ten_mb = 10 * 1024 * 1024;
-        consumer.consume(ten_mb, running);
-        assert_eq!(consumer.get_current_usage(), ten_mb);
+    fn test_step_adds_memory_when_below_low() {
+        let mut c = MemoryController::new(100 * 1024 * 1024);
+        c.step(0, running());
+        assert!(c.allocated_bytes() >= 16 * 1024 * 1024);
     }
 
     #[test]
-    fn test_consume_zero() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-        consumer.consume(0, running);
-        assert_eq!(consumer.get_current_usage(), 0);
+    fn test_step_can_overallocate_to_chase_observed_private() {
+        let mut c = MemoryController::new(100 * 1024 * 1024);
+        c.step(0, running());
+        let first = c.allocated_bytes();
+        c.step(0, running());
+        assert!(c.allocated_bytes() >= first);
     }
 
     #[test]
-    fn test_consume_one_byte() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-        consumer.consume(1, running);
-        assert_eq!(consumer.get_current_usage(), 1);
-    }
-
-    #[test]
-    fn test_consume_partial_mb() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-        let partial = 512 * 1024 + 100;
-        consumer.consume(partial, running);
-        assert_eq!(consumer.get_current_usage(), partial);
-    }
-
-    #[test]
-    fn test_adjust_to_increase() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        consumer.consume(5 * 1024 * 1024, Arc::clone(&running));
-        assert_eq!(consumer.get_current_usage(), 5 * 1024 * 1024);
-
-        consumer.adjust_to(10 * 1024 * 1024, running);
-        assert_eq!(consumer.get_current_usage(), 10 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_adjust_to_decrease() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        consumer.consume(10 * 1024 * 1024, Arc::clone(&running));
-        assert_eq!(consumer.get_current_usage(), 10 * 1024 * 1024);
-
-        consumer.adjust_to(5 * 1024 * 1024, running);
-        assert_eq!(consumer.get_current_usage(), 5 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_adjust_to_same() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        consumer.consume(10 * 1024 * 1024, Arc::clone(&running));
-        consumer.adjust_to(10 * 1024 * 1024, running);
-        assert_eq!(consumer.get_current_usage(), 10 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_adjust_to_zero() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        consumer.consume(10 * 1024 * 1024, Arc::clone(&running));
-        consumer.adjust_to(0, running);
-        assert_eq!(consumer.get_current_usage(), 0);
-    }
-
-    #[test]
-    fn test_release_percent_20() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        let initial = 100 * 1024 * 1024;
-        consumer.consume(initial, Arc::clone(&running));
-        assert_eq!(consumer.get_current_usage(), initial);
-
-        consumer.release_percent(20, running);
-        assert_eq!(consumer.get_current_usage(), 80 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_release_percent_50() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        let initial = 100 * 1024 * 1024;
-        consumer.consume(initial, Arc::clone(&running));
-
-        consumer.release_percent(50, running);
-        assert_eq!(consumer.get_current_usage(), 50 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_release_percent_100() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        consumer.consume(100 * 1024 * 1024, Arc::clone(&running));
-        consumer.release_percent(100, running);
-        assert_eq!(consumer.get_current_usage(), 0);
-    }
-
-    #[test]
-    fn test_multiple_adjustments() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        consumer.consume(10 * 1024 * 1024, Arc::clone(&running));
-        assert_eq!(consumer.get_current_usage(), 10 * 1024 * 1024);
-
-        consumer.adjust_to(20 * 1024 * 1024, Arc::clone(&running));
-        assert_eq!(consumer.get_current_usage(), 20 * 1024 * 1024);
-
-        consumer.adjust_to(5 * 1024 * 1024, Arc::clone(&running));
-        assert_eq!(consumer.get_current_usage(), 5 * 1024 * 1024);
-
-        consumer.adjust_to(15 * 1024 * 1024, running);
-        assert_eq!(consumer.get_current_usage(), 15 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_large_allocation() {
-        let mut consumer = MemoryConsumer::new();
-        let running = create_running_flag();
-
-        let large = 100 * 1024 * 1024;
-        consumer.consume(large, running);
-        assert_eq!(consumer.get_current_usage(), large);
-    }
-
-    #[test]
-    fn test_stops_on_running_false() {
-        let mut consumer = MemoryConsumer::new();
-        let running = Arc::new(AtomicBool::new(false));
-
-        consumer.consume(10 * 1024 * 1024, running);
-        assert_eq!(consumer.get_current_usage(), 0);
+    fn test_step_caps_overallocation() {
+        let target = 100 * 1024 * 1024;
+        let mut c = MemoryController::new(target);
+        for _ in 0..20 {
+            c.step(0, running());
+        }
+        assert!(c.allocated_bytes() <= (target as f64 * MAX_BOOST_FACTOR) as usize);
     }
 }
