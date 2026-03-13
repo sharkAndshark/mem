@@ -56,11 +56,11 @@ mod imp {
 #[cfg(target_os = "windows")]
 mod imp {
     use std::mem::size_of;
-    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Foundation::{GetLastError, FILETIME};
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
     fn filetime_to_u64(ft: FILETIME) -> u64 {
         ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
